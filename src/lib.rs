@@ -17,12 +17,8 @@
 //!   change.
 //! - It does not support shrinking of the underlying storage yet. However, since the structure
 //!   uses a bucket of pointers, unused preallocated pointers only consume the null pointer size.
-//! - ABA protection for pointer operations is not implemented yet.
 //! - Performance optimizations are still ongoing.
 //! - Operations on atomics are always wrapping on overflow.
-//! - Since the map relies on atomic pointers before the atomic values, operations like `fetch_add`
-//!   are not true read-modify-write operations. This may affect the choice of memory orderings.
-//!   In those cases, the ordering is sanitized for loads and stores accordingly.
 //!
 //! # Getting Started
 //!
@@ -97,16 +93,17 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
     },
 };
 
-use crate::{numbers::AtomicNumber, pointer::SafeAtomicPtr};
+use arc_swap::{ArcSwap, ArcSwapOption};
+
+use crate::numbers::AtomicNumber;
 
 mod numbers;
-mod pointer;
 
-type Bucket<K, V> = Vec<Arc<SafeAtomicPtr<(K, V)>>>;
+type Bucket<K, V> = Vec<Arc<ArcSwapOption<(K, V)>>>;
 
 /// Errors that can occur during Robin Hood insertion.
 ///
@@ -131,8 +128,8 @@ where
     V: AtomicNumber,
     H: Hasher + Default,
 {
-    bucket: SafeAtomicPtr<Bucket<K, V>>,
-    length: AtomicUsize,
+    bucket: ArcSwap<Bucket<K, V>>,
+    length: AtomicIsize,
     is_expanding: AtomicBool,
     hasher: PhantomData<H>,
 }
@@ -149,8 +146,8 @@ where
     /// * [`HyperCounter<K, V>`] - A new HyperCounter instance.
     pub fn new() -> Self {
         Self {
-            bucket: SafeAtomicPtr::new(Arc::new(Vec::new())),
-            length: AtomicUsize::new(0),
+            bucket: ArcSwap::new(Arc::new(Vec::new())),
+            length: AtomicIsize::new(0),
             is_expanding: AtomicBool::new(false),
             hasher: PhantomData,
         }
@@ -161,7 +158,9 @@ where
     /// Returns:
     /// * [`usize`] - The current length.
     pub fn len(&self) -> usize {
-        self.length.load(Ordering::Acquire)
+        let value = self.length.load(Ordering::Acquire);
+
+        if value < 0 { 0 } else { value as usize }
     }
 
     /// Checks if the HyperCounter is empty.
@@ -178,12 +177,7 @@ where
     /// Returns:
     /// * [`usize`] - The current capacity.
     pub fn capacity(&self) -> usize {
-        self.bucket
-            .load(Ordering::Acquire)
-            .expect(
-                "HyperCounter's bucket pointer was null. It should never be null! (this is a bug)",
-            )
-            .capacity()
+        self.bucket.load().capacity()
     }
 
     /// Attempts to lease the resizing lock.
@@ -248,13 +242,12 @@ where
             let slot_index = (index + i) % capacity;
             let slot = &bucket[slot_index];
 
-            // If it fails, it'll be `Some`.
-            if let Err(Some(existing)) = slot.compare_exchange(
-                None,
-                Some(current.clone()),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            let result = slot.compare_and_swap(&None::<Arc<(K, V)>>, Some(current.clone()));
+
+            // If it fails, it'll be `Some` because we compared against `None`.
+            if let Some(existing) = &*result {
+                let existing = existing.clone();
+
                 if current.0 == existing.0 {
                     return Err(RobinHoodError::Duplicate(existing));
                 }
@@ -269,14 +262,13 @@ where
                 let distance_existing = (slot_index + capacity - index_existing) % capacity;
 
                 if distance_current > distance_existing {
+                    let option_existing = Some(existing.clone());
+
                     if slot
-                        .compare_exchange(
-                            Some(&existing),
-                            Some(current.clone()),
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
+                        .compare_and_swap(&option_existing, Some(current.clone()))
+                        .as_ref()
+                        .map(Arc::as_ptr)
+                        == option_existing.as_ref().map(Arc::as_ptr)
                     {
                         current = existing;
 
@@ -318,9 +310,9 @@ where
 
         let entry = loop {
             let slot = &bucket[i];
-            let loaded = slot.load(Ordering::Acquire);
+            let loaded = slot.load();
 
-            if let Some(entry) = loaded {
+            if let Some(entry) = loaded.clone() {
                 if entry.0 == *key {
                     break entry;
                 }
@@ -366,9 +358,9 @@ where
             let prev_index = i % capacity;
 
             let curr_slot = &bucket[curr_index];
-            let curr = curr_slot.load(Ordering::Acquire);
+            let curr = curr_slot.load();
 
-            if let Some(curr_entry) = curr {
+            if let Some(curr_entry) = &*curr {
                 let curr_entry_index = self.hash(&curr_entry.0) as usize % capacity;
 
                 if curr_entry_index == curr_index {
@@ -378,12 +370,19 @@ where
 
                 let prev_slot = &bucket[prev_index];
 
-                let swap_result = prev_slot.compare_exchange(
-                    Some(&prev_entry),
-                    Some(curr_entry),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
+                let swap_result =
+                    prev_slot.compare_and_swap(&Some(prev_entry.clone()), Some(curr_entry.clone()));
+
+                let swap_result = {
+                    let success =
+                        swap_result.as_ref().map(Arc::as_ptr) == Some(Arc::as_ptr(&prev_entry));
+
+                    if success {
+                        Ok(swap_result.clone())
+                    } else {
+                        Err(swap_result.clone())
+                    }
+                };
 
                 match swap_result {
                     Ok(Some(prev_curr_entry)) => {
@@ -413,10 +412,9 @@ where
         }
 
         let slot = &bucket[i];
-        slot.compare_exchange(Some(&prev_entry), None, Ordering::AcqRel, Ordering::Relaxed)
-            .ok();
+        slot.compare_and_swap(&Some(prev_entry), None);
 
-        Some(entry)
+        Some(entry.clone())
     }
 
     /// Expands the bucket to a new capacity.
@@ -440,12 +438,12 @@ where
             bucket.len() * 2
         };
 
-        let new_bucket: Vec<Arc<SafeAtomicPtr<(K, V)>>> = (0..new_capacity)
-            .map(|_| Arc::new(SafeAtomicPtr::null()))
+        let new_bucket: Vec<Arc<ArcSwapOption<(K, V)>>> = (0..new_capacity)
+            .map(|_| Arc::new(ArcSwapOption::empty()))
             .collect();
 
         for entry in bucket {
-            if let Some(entry) = entry.load(Ordering::Acquire) {
+            if let Some(entry) = entry.load().clone() {
                 // TODO: Is this really safe to ignore?
                 let _ = self.robin_hood_insert(&new_bucket, entry);
             }
@@ -453,8 +451,7 @@ where
 
         let new_bucket = Arc::new(new_bucket);
 
-        self.bucket
-            .swap(Some(new_bucket.clone()), Ordering::Release);
+        self.bucket.swap(new_bucket.clone());
 
         new_bucket
     }
@@ -476,39 +473,18 @@ where
         }
     }
 
-    /// Gets the appropriate store ordering based on the provided ordering.
-    ///
-    /// This is because [`HyperCounter::fetch_add()`] is not a real read-modify-write operation
-    /// since it has to combine a fetch to the atomic pointer before updating the atomic number.
-    ///
-    /// Arguments:
-    /// * `ordering` - The original memory ordering.
-    ///
-    /// Returns:
-    /// * `Ordering` - The adjusted store ordering.
-    fn get_store_ordering(&self, ordering: Ordering) -> Ordering {
-        match ordering {
-            Ordering::Acquire | Ordering::AcqRel => Ordering::Release,
-            o => o,
-        }
-    }
-
     /// Fetches an entry by key.
     ///
     /// Arguments:
     /// * `key` - The key to fetch.
-    /// * `ordering` - The memory ordering to use.
     ///
     /// Returns:
     /// * `Some(Arc<(K, V)>)` - if the entry was found.
     /// * `None` - if the entry was not found.
-    fn fetch(&self, key: &K, ordering: Ordering) -> Option<Arc<(K, V)>> {
+    fn fetch(&self, key: &K) -> Option<Arc<(K, V)>> {
         let hash = self.hash(key);
 
-        let bucket = self
-            .bucket
-            .load(ordering)
-            .expect("The HyperCounter bucket pointer was null! It should never be null.");
+        let bucket = self.bucket.load();
 
         if bucket.is_empty() {
             return None;
@@ -518,7 +494,7 @@ where
             let index = (hash as usize + i) % bucket.len();
 
             // Return None if the entry is vacant
-            let entry_ptr = bucket[index].load(ordering)?;
+            let entry_ptr = bucket[index].load().clone()?;
 
             if entry_ptr.0 == *key {
                 return Some(entry_ptr);
@@ -536,16 +512,12 @@ where
     ///
     /// Arguments:
     /// * `pair` - The key-value pair to insert.
-    /// * `ordering` - The memory ordering to use.
     ///
     /// Returns:
     /// * `Ok(())` - if the insertion was successful.
     /// * `Err(RobinHoodError<K, V>)` - if an error occurred during insertion.
-    fn insert(&self, pair: Arc<(K, V)>, ordering: Ordering) -> Result<(), RobinHoodError<K, V>> {
-        let mut bucket = self
-            .bucket
-            .load(self.get_load_ordering(ordering))
-            .expect("The HyperCounter bucket pointer was null! It should never be null.");
+    fn insert(&self, pair: Arc<(K, V)>) -> Result<(), RobinHoodError<K, V>> {
+        let mut bucket = self.bucket.load().clone();
 
         if self.should_expand(&bucket)
             && let Some(lease) = self.lease_expansion()
@@ -565,16 +537,12 @@ where
     ///
     /// Arguments:
     /// * `key` - The key to remove.
-    /// * `ordering` - The memory ordering to use.
     ///
     /// Returns:
     /// * `Some(Arc<(K, V)>)` - if the entry was found and removed.
     /// * `None` - if the entry was not found.
-    fn remove(&self, key: &K, ordering: Ordering) -> Option<Arc<(K, V)>> {
-        let bucket = self
-            .bucket
-            .load(self.get_load_ordering(ordering))
-            .expect("The HyperCounter bucket pointer was null! It should never be null.");
+    fn remove(&self, key: &K) -> Option<Arc<(K, V)>> {
+        let bucket = self.bucket.load();
 
         let result = self.robin_hood_remove(&bucket, key)?;
         self.length.fetch_sub(1, Ordering::Relaxed);
@@ -605,7 +573,7 @@ where
     /// * [`V::Primitive`] - The current value associated with the key, or zero if the key is
     ///   missing.
     pub fn load(&self, key: &K, ordering: Ordering) -> V::Primitive {
-        self.fetch(key, ordering)
+        self.fetch(key)
             .map(|i| i.1.load(ordering))
             .unwrap_or(V::ZERO)
     }
@@ -625,7 +593,7 @@ where
     /// * [`V::Primitive`] - The previous value associated with the key. (before swap)
     pub fn swap(&self, key: K, new_value: V::Primitive, ordering: Ordering) -> V::Primitive {
         if new_value == V::ZERO {
-            let old = self.remove(&key, self.get_store_ordering(ordering));
+            let old = self.remove(&key);
 
             old.map(|i| i.1.load(self.get_load_ordering(ordering)))
                 .unwrap_or(V::ZERO)
@@ -633,12 +601,12 @@ where
             let new_entry = Arc::new((key, V::new(new_value)));
 
             loop {
-                let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+                let entry = self.fetch(&new_entry.0);
 
                 if let Some(entry) = entry {
                     return entry.1.swap(new_value, ordering);
                 } else {
-                    match self.insert(new_entry.clone(), self.get_store_ordering(ordering)) {
+                    match self.insert(new_entry.clone()) {
                         Ok(()) => {
                             return V::ZERO;
                         }
@@ -674,19 +642,19 @@ where
         let new_entry = Arc::new((key, V::new(value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 // TODO: If the value after fetch_add() is zero, remove the entry.
                 let result = entry.1.fetch_add(value, ordering);
 
                 if V::primitive_wrapping_add(result, value) == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
             } else {
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -718,19 +686,19 @@ where
         let new_entry = Arc::new((key, V::new(V::primitive_wrapping_sub(V::ZERO, value))));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 // TODO: If the value after fetch_sub() is zero, remove the entry.
                 let result = entry.1.fetch_sub(value, ordering);
 
                 if V::primitive_wrapping_sub(result, value) == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
             } else {
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -757,7 +725,7 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before AND operation)
     pub fn fetch_and(&self, key: &K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let entry = self.fetch(key, self.get_load_ordering(ordering));
+        let entry = self.fetch(key);
 
         if let Some(entry) = entry {
             entry.1.fetch_and(value, ordering)
@@ -781,18 +749,18 @@ where
         let new_entry = Arc::new((key, V::new(!value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 let result = entry.1.fetch_nand(value, ordering);
 
                 if !(result & value) == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
             } else {
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -822,18 +790,18 @@ where
         let new_entry = Arc::new((key, V::new(value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 let result = entry.1.fetch_or(value, ordering);
 
                 if result | value == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
             } else {
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -865,18 +833,18 @@ where
         let new_entry = Arc::new((key, V::new(value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 let result = entry.1.fetch_xor(value, ordering);
 
                 if result ^ value == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
             } else {
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -908,13 +876,13 @@ where
         let new_entry = Arc::new((key, V::new(value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 let result = entry.1.fetch_max(value, ordering);
 
                 if value >= result && value == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
@@ -923,7 +891,7 @@ where
                     return V::ZERO;
                 }
 
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -955,13 +923,13 @@ where
         let new_entry = Arc::new((key, V::new(value)));
 
         loop {
-            let entry = self.fetch(&new_entry.0, self.get_load_ordering(ordering));
+            let entry = self.fetch(&new_entry.0);
 
             if let Some(entry) = entry {
                 let result = entry.1.fetch_min(value, ordering);
 
                 if value <= result && value == V::ZERO {
-                    self.remove(&entry.0, self.get_store_ordering(ordering));
+                    self.remove(&entry.0);
                 }
 
                 return result;
@@ -970,7 +938,7 @@ where
                     return V::ZERO;
                 }
 
-                let result = self.insert(new_entry.clone(), self.get_store_ordering(ordering));
+                let result = self.insert(new_entry.clone());
 
                 if let Err(RobinHoodError::Duplicate(existing)) = result {
                     // Another thread inserted it first, insert to that value instead.
@@ -1128,6 +1096,35 @@ mod tests {
 
         for &ordering in &load_orderings {
             counter.load(&"key".to_string(), ordering);
+        }
+    }
+
+    #[test]
+    fn test_hypercounter_concurrency() {
+        let counter: Arc<HyperCounter<String, AtomicUsize>> = Arc::new(HyperCounter::new());
+
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let counter = Arc::clone(&counter);
+
+            let handle = std::thread::spawn(move || {
+                let key = "key".to_string();
+
+                for i in 0..1_000_000 {
+                    if i % 2 == 0 {
+                        counter.fetch_add(key.clone(), 1, Ordering::Relaxed)
+                    } else {
+                        counter.fetch_sub(key.clone(), 1, Ordering::Relaxed)
+                    };
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
         }
     }
 }
