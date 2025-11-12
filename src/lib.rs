@@ -235,6 +235,10 @@ where
 
         let capacity = bucket.len();
 
+        if capacity == 0 {
+            return Err(RobinHoodError::Full);
+        }
+
         let hash = self.hash(&current.0);
         let index = hash as usize % capacity;
 
