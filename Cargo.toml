@@ -1,7 +1,7 @@
 [package]
 name = "hypercounter"
 description = "An atomic, lock-free, hash map-like counter structure."
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 authors = ["Nyeki"]
