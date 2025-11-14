@@ -1,23 +1,10 @@
 //! An atomic, lock-free, hash map-like counter structure.
-//!
-//! It uses Robin Hood hashing for collision resolution and supports concurrent access and
-//! modification of counters associated with keys. None of the operations require locks, making it
-//! suitable for high-performance scenarios.
-//!
-//! # Features
-//!
-//! - Atomic operations for incrementing and decrementing counters.
-//! - Lock-free design for concurrent access.
-//! - Robin Hood hashing for efficient collision resolution.
-//! - Automatic resizing of the underlying storage when needed.
+//! 
+//! It uses [`papaya::HashMap`] under the hood to provide concurrent access to multiple keys at
+//! once, allowing for efficient counting without the need for locks.
 //!
 //! ## Notes Before Use
-//!
-//! - This is an experimental library and may not be suitable for production use yet. The API may
-//!   change.
-//! - It does not support shrinking of the underlying storage yet. However, since the structure
-//!   uses a bucket of pointers, unused preallocated pointers only consume the null pointer size.
-//! - Performance optimizations are still ongoing.
+//! 
 //! - Operations on atomics are always wrapping on overflow.
 //!
 //! # Getting Started
@@ -28,7 +15,7 @@
 //! cargo add hypercounter
 //! ```
 //!
-//! That's it! To start using it, create a new `HyperCounter` instance:
+//! That's it! To start using it, create a new [`HyperCounter`] instance:
 //!
 //! ```rust
 //! use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,11 +59,6 @@
 //! - [`HyperCounter::fetch_min()`]: Atomically sets the counter for a given key to the minimum of
 //!   the current value and the provided value.
 //!
-//! ## Resizing
-//!
-//! The `HyperCounter` automatically duplicates its internal storage when the load factor exceeds
-//! 75%. Its capacity starts at 8 and doubles with each expansion. Shrinking is not supported yet.
-//!
 //! # Benchmarking
 //!
 //! There's a simple benchmark example included in the `examples` directory. You can run it using:
@@ -89,29 +71,30 @@
 //! for various scenarios.
 
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{BuildHasher, Hash, RandomState},
     sync::{Arc, atomic::Ordering},
 };
 
-use crate::{map::TurboMap, numbers::AtomicNumber};
+use papaya::HashMap;
 
-pub mod map;
+use crate::numbers::AtomicNumber;
+
 mod numbers;
 
-pub struct HyperCounter<K, V, H = DefaultHasher>
+pub struct HyperCounter<K, V, H = RandomState>
 where
     K: Eq + Hash,
     V: AtomicNumber,
-    H: Hasher + Default,
+    H: BuildHasher + Default,
 {
-    inner: TurboMap<K, V, H>,
+    inner: HashMap<K, Arc<V>, H>,
 }
 
 impl<K, V, H> HyperCounter<K, V, H>
 where
     K: Eq + Hash,
     V: AtomicNumber,
-    H: Hasher + Default,
+    H: BuildHasher + Default,
 {
     /// Creates a new, empty HyperCounter.
     ///
@@ -119,7 +102,7 @@ where
     /// * [`HyperCounter<K, V>`] - A new HyperCounter instance.
     pub fn new() -> Self {
         Self {
-            inner: TurboMap::new(),
+            inner: HashMap::with_hasher(H::default()),
         }
     }
 
@@ -138,14 +121,6 @@ where
     /// * `false` - otherwise.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
-    }
-
-    /// Returns the current capacity of the HyperCounter.
-    ///
-    /// Returns:
-    /// * [`usize`] - The current capacity.
-    pub fn capacity(&self) -> usize {
-        self.inner.capacity()
     }
 
     /// Gets the appropriate load ordering based on the provided ordering.
@@ -176,8 +151,9 @@ where
     ///   missing.
     pub fn load(&self, key: &K, ordering: Ordering) -> V::Primitive {
         self.inner
+            .pin()
             .get(key)
-            .map(|i| i.1.load(ordering))
+            .map(|i| i.load(ordering))
             .unwrap_or(V::ZERO)
     }
 
@@ -195,27 +171,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before swap)
     pub fn swap(&self, key: K, new_value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        if new_value == V::ZERO {
-            let old = self.inner.remove(&key);
+        let map = self.inner.pin();
 
-            old.map(|i| i.1.load(self.get_load_ordering(ordering)))
+        if new_value == V::ZERO {
+            let old = map.remove(&key);
+
+            old.map(|i| i.load(self.get_load_ordering(ordering)))
                 .unwrap_or(V::ZERO)
         } else {
-            let new_entry = Arc::new((key, V::new(new_value)));
-
-            let entry = self.inner.get(&new_entry.0);
+            let entry = map.get(&key);
 
             if let Some(entry) = entry {
-                entry.1.swap(new_value, ordering)
+                entry.swap(new_value, ordering)
             } else {
-                match self.inner.insert(new_entry.clone()) {
-                    Ok(()) => V::ZERO,
-                    Err(existing) => {
-                        // Another thread inserted it first, insert to that value instead.
-                        let entry = existing;
-                        entry.1.swap(new_value, ordering)
-                    }
-                }
+                let value = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
+
+                value.swap(new_value, ordering)
             }
         }
     }
@@ -234,28 +205,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before addition)
     pub fn fetch_add(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            // TODO: If the value after fetch_add() is zero, remove the entry.
-            let result = entry.1.fetch_add(value, ordering);
+            let result = entry.fetch_add(value, ordering);
 
             if V::primitive_wrapping_add(result, value) == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_add(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_add(value, ordering)
         }
     }
 
@@ -273,28 +238,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before subtraction)
     pub fn fetch_sub(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(V::primitive_wrapping_sub(V::ZERO, value))));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            // TODO: If the value after fetch_sub() is zero, remove the entry.
-            let result = entry.1.fetch_sub(value, ordering);
+            let result = entry.fetch_sub(value, ordering);
 
             if V::primitive_wrapping_sub(result, value) == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_sub(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_sub(value, ordering)
         }
     }
 
@@ -310,10 +269,12 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before AND operation)
     pub fn fetch_and(&self, key: &K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let entry = self.inner.get(key);
+        let map = self.inner.pin();
+
+        let entry = map.get(key);
 
         if let Some(entry) = entry {
-            entry.1.fetch_and(value, ordering)
+            entry.fetch_and(value, ordering)
         } else {
             V::ZERO
         }
@@ -331,27 +292,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before NAND operation)
     pub fn fetch_nand(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(!value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            let result = entry.1.fetch_nand(value, ordering);
+            let result = entry.fetch_nand(value, ordering);
 
             if !(result & value) == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_nand(value, ordering);
-            }
-
-            !V::ZERO
+            result.fetch_nand(value, ordering)
         }
     }
 
@@ -367,27 +323,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before OR operation)
     pub fn fetch_or(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            let result = entry.1.fetch_or(value, ordering);
+            let result = entry.fetch_or(value, ordering);
 
             if result | value == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_or(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_or(value, ordering)
         }
     }
 
@@ -405,27 +356,22 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before XOR operation)
     pub fn fetch_xor(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            let result = entry.1.fetch_xor(value, ordering);
+            let result = entry.fetch_xor(value, ordering);
 
             if result ^ value == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_xor(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_xor(value, ordering)
         }
     }
 
@@ -443,31 +389,28 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before max operation)
     pub fn fetch_max(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            let result = entry.1.fetch_max(value, ordering);
+            let result = entry.fetch_max(value, ordering);
 
             if value >= result && value == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
+            // If there's no value (i.e. entry == None), the default is zero. If the value is less
+            // than or equal to zero, then nothing changes and we return zero.
             if value <= V::ZERO {
                 return V::ZERO;
             }
 
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_max(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_max(value, ordering)
         }
     }
 
@@ -485,31 +428,28 @@ where
     /// Returns:
     /// * [`V::Primitive`] - The previous value associated with the key. (before min operation)
     pub fn fetch_min(&self, key: K, value: V::Primitive, ordering: Ordering) -> V::Primitive {
-        let new_entry = Arc::new((key, V::new(value)));
+        let map = self.inner.pin();
 
-        let entry = self.inner.get(&new_entry.0);
+        let entry = map.get(&key);
 
         if let Some(entry) = entry {
-            let result = entry.1.fetch_min(value, ordering);
+            let result = entry.fetch_min(value, ordering);
 
             if value <= result && value == V::ZERO {
-                self.inner.remove(&entry.0);
+                map.remove(&key);
             }
 
             result
         } else {
+            // If there's no value (i.e. entry == None), the default is zero. If the value is
+            // higher than or equal to zero, then nothing changes and we return zero.
             if value >= V::ZERO {
                 return V::ZERO;
             }
 
-            let result = self.inner.insert(new_entry.clone());
+            let result = map.get_or_insert(key, Arc::new(V::new(V::ZERO)));
 
-            if let Err(existing) = result {
-                // Another thread inserted it first, insert to that value instead.
-                return existing.1.fetch_min(value, ordering);
-            }
-
-            V::ZERO
+            result.fetch_min(value, ordering)
         }
     }
 }
@@ -540,7 +480,6 @@ mod tests {
         assert_eq!(prev, 0);
         assert_eq!(counter.len(), 1);
         assert!(!counter.is_empty());
-        assert_eq!(counter.capacity(), 8);
 
         let prev = counter.fetch_add("apple".to_string(), 3, Ordering::SeqCst);
         assert_eq!(prev, 5);
