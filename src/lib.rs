@@ -498,7 +498,7 @@ where
         map.iter().for_each(|(k, v)| {
             let value = v.load(ordering_load);
 
-            if f(k, &value) {
+            if !f(k, &value) {
                 if value > V::ZERO {
                     self.fetch_sub(k.clone(), value, ordering_remove);
                 } else {
