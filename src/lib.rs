@@ -1,10 +1,10 @@
 //! An atomic, lock-free, hash map-like counter structure.
-//! 
+//!
 //! It uses [`papaya::HashMap`] under the hood to provide concurrent access to multiple keys at
 //! once, allowing for efficient counting without the need for locks.
 //!
 //! ## Notes Before Use
-//! 
+//!
 //! - Operations on atomics are always wrapping on overflow.
 //!
 //! # Getting Started
@@ -451,6 +451,61 @@ where
 
             result.fetch_min(value, ordering)
         }
+    }
+
+    /// Removes all entries in the [`HyperCounter`].
+    pub fn clear(&self) {
+        let map = self.inner.pin();
+        map.clear();
+    }
+
+    /// Scans all entries in the [`HyperCounter`] and applies the provided function to each
+    /// key-value.
+    ///
+    /// Arguments:
+    /// * `f` - The function to apply to each key-value pair.
+    /// * `ordering` - The memory ordering to use when loading values.
+    pub fn scan(&self, f: impl Fn(&K, &V::Primitive), ordering: Ordering) {
+        let map = self.inner.pin();
+        map.iter().for_each(|(k, v)| {
+            let value = v.load(ordering);
+
+            f(k, &value);
+        });
+    }
+}
+
+impl<K, V, H> HyperCounter<K, V, H>
+where
+    K: Eq + Hash + Clone,
+    V: AtomicNumber,
+    H: BuildHasher + Default,
+{
+    /// Retains only the entries specified by the predicate function.
+    /// 
+    /// Arguments:
+    /// * `f` - The predicate function to determine which entries to retain.
+    /// * `ordering_load` - The memory ordering to use when loading values.
+    /// * `ordering_remove` - The memory ordering to use when removing entries.
+    pub fn retain(
+        &self,
+        f: impl Fn(&K, &V::Primitive) -> bool,
+        ordering_load: Ordering,
+        ordering_remove: Ordering,
+    ) {
+        let map = self.inner.pin();
+
+        map.iter().for_each(|(k, v)| {
+            let value = v.load(ordering_load);
+
+            if f(k, &value) {
+                if value > V::ZERO {
+                    self.fetch_sub(k.clone(), value, ordering_remove);
+                } else {
+                    self.fetch_add(k.clone(), !value, ordering_remove);
+                }
+            }
+        });
     }
 }
 
