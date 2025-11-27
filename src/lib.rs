@@ -465,7 +465,7 @@ where
     /// Arguments:
     /// * `f` - The function to apply to each key-value pair.
     /// * `ordering` - The memory ordering to use when loading values.
-    pub fn scan(&self, f: impl Fn(&K, &V::Primitive), ordering: Ordering) {
+    pub fn scan(&self, mut f: impl FnMut(&K, &V::Primitive), ordering: Ordering) {
         let map = self.inner.pin();
         map.iter().for_each(|(k, v)| {
             let value = v.load(ordering);
@@ -489,7 +489,7 @@ where
     /// * `ordering_remove` - The memory ordering to use when removing entries.
     pub fn retain(
         &self,
-        f: impl Fn(&K, &V::Primitive) -> bool,
+        mut f: impl FnMut(&K, &V::Primitive) -> bool,
         ordering_load: Ordering,
         ordering_remove: Ordering,
     ) {
